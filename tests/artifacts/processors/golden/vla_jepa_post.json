@@ -6,7 +6,10 @@
       "registry_name": "vla_jepa_clip_actions"
     },
     {
-      "config": {},
+      "config": {
+        "gripper_dim": 6,
+        "threshold": 0.5
+      },
       "registry_name": "vla_jepa_pre_snap_gripper"
     },
     {
@@ -52,7 +55,10 @@
       "state_file": "policy_postprocessor_step_2_unnormalizer_processor.safetensors"
     },
     {
-      "config": {},
+      "config": {
+        "gripper_dim": 6,
+        "threshold": 0.5
+      },
       "registry_name": "vla_jepa_binarize_gripper"
     },
     {
