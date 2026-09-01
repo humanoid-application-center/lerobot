@@ -22,10 +22,9 @@ import pytest
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
-    load_training_batch_size,
-    load_training_num_processes,
     load_training_state,
     load_training_step,
+    load_training_total_batch_size,
     push_checkpoint_to_hub,
     save_checkpoint,
     save_training_state,
@@ -68,26 +67,15 @@ def test_load_training_step(tmp_path):
     assert loaded_step == step
 
 
-def test_save_training_state_records_num_processes(tmp_path, optimizer, scheduler):
-    save_training_state(tmp_path, 10, optimizer, scheduler, num_processes=4)
-    assert load_training_num_processes(tmp_path) == 4
+def test_save_training_state_records_total_batch_size(tmp_path, optimizer, scheduler):
+    save_training_state(tmp_path, 10, optimizer, scheduler, total_batch_size=32)
+    assert load_training_total_batch_size(tmp_path) == 32
 
 
-def test_load_training_num_processes_absent_returns_none(tmp_path, optimizer, scheduler):
-    # Checkpoints written before the world size was recorded must still load (back-compat).
-    save_training_state(tmp_path, 10, optimizer, scheduler)
-    assert load_training_num_processes(tmp_path) is None
-
-
-def test_save_training_state_records_batch_size(tmp_path, optimizer, scheduler):
-    save_training_state(tmp_path, 10, optimizer, scheduler, batch_size=32)
-    assert load_training_batch_size(tmp_path) == 32
-
-
-def test_load_training_batch_size_absent_returns_none(tmp_path, optimizer, scheduler):
+def test_load_training_total_batch_size_absent_returns_none(tmp_path, optimizer, scheduler):
     # Checkpoints written before the batch size was recorded must still load (back-compat).
     save_training_state(tmp_path, 10, optimizer, scheduler)
-    assert load_training_batch_size(tmp_path) is None
+    assert load_training_total_batch_size(tmp_path) is None
 
 
 def test_update_last_checkpoint(tmp_path):
