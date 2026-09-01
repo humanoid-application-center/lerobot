@@ -214,23 +214,23 @@ def test_deterministic_sampler_resume_is_exact_at_scale():
 
 
 def test_compute_sampler_state():
-    # 100 frames, batch 10, 2 ranks -> 10 underlying batches, 5 per rank per epoch.
-    assert compute_sampler_state(step=0, num_frames=100, batch_size=10, num_processes=2) == {
+    # 100 frames, total_batch_size 20 (batch 10 x 2 ranks) -> 5 batches per epoch.
+    assert compute_sampler_state(step=0, num_frames=100, total_batch_size=20) == {
         "epoch": 0,
         "start_index": 0,
     }
-    # step 7 -> epoch 1, 2 per-rank batches in = 2 * 10 * 2 = 40 samples in
-    assert compute_sampler_state(step=7, num_frames=100, batch_size=10, num_processes=2) == {
+    # step 7 -> epoch 1, 2 batches in = 2 * 20 = 40 samples in
+    assert compute_sampler_state(step=7, num_frames=100, total_batch_size=20) == {
         "epoch": 1,
         "start_index": 40,
     }
-    # uneven epoch: 95 frames -> 10 underlying batches (last short), still 5 per rank
-    assert compute_sampler_state(step=12, num_frames=95, batch_size=10, num_processes=2) == {
+    # uneven epoch: 95 frames -> still 5 batches per epoch (last one short)
+    assert compute_sampler_state(step=12, num_frames=95, total_batch_size=20) == {
         "epoch": 2,
         "start_index": 40,
     }
-    # uneven sharding: 105 frames -> 11 underlying batches, 6 per rank (even_batches pads)
-    assert compute_sampler_state(step=11, num_frames=105, batch_size=10, num_processes=2) == {
+    # uneven sharding: 105 frames -> 6 batches per epoch (even_batches padding included)
+    assert compute_sampler_state(step=11, num_frames=105, total_batch_size=20) == {
         "epoch": 1,
         "start_index": 100,
     }

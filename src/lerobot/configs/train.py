@@ -98,7 +98,12 @@ class TrainPipelineConfig(HubMixin):
     cudnn_deterministic: bool = False
     # Number of workers for the dataloader.
     num_workers: int = 4
-    batch_size: int = 8
+    # Per-process micro-batch size (what the dataloader yields to each rank).
+    batch_size: int = 16
+    # Target global batch size (batch_size * num_processes * gradient accumulation steps). Must be
+    # a multiple of batch_size; when larger than batch_size * num_processes, lerobot_train reaches
+    # it via gradient accumulation (accelerator.accumulate).
+    total_batch_size: int = 16
     prefetch_factor: int = 4
     persistent_workers: bool = True
     steps: int = 100_000
@@ -245,6 +250,12 @@ class TrainPipelineConfig(HubMixin):
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+
+        if self.total_batch_size % self.batch_size != 0:
+            raise ValueError(
+                f"total_batch_size ({self.total_batch_size}) must be a multiple of batch_size "
+                f"({self.batch_size}) so it can be reached via gradient accumulation."
+            )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

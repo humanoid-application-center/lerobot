@@ -159,11 +159,11 @@ class EpisodeAwareSampler:
         return self._num_frames
 
 
-def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
+def compute_sampler_state(step: int, num_frames: int, total_batch_size: int) -> dict:
     """Map an optimization step to an `EpisodeAwareSampler` state for sample-exact resume.
 
-    Under accelerate's batch sharding, one step consumes `batch_size * num_processes` sampler
-    positions and each rank sees `ceil(ceil(num_frames / batch_size) / num_processes)` batches
+    Under accelerate's batch sharding, one step consumes `total_batch_size` sampler
+    positions and each rank sees `ceil(num_frames / total_batch_size)` batches
     per epoch (`even_batches` padding included). The start index provably stays below
     `num_frames`; the `min` is defensive.
 
@@ -175,7 +175,7 @@ def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_proce
           mirrors that padding; with `even_batches=False` the per-epoch batch count differs and
           the boundary is off.
     """
-    batches_per_epoch = math.ceil(math.ceil(num_frames / batch_size) / num_processes)
+    batches_per_epoch = math.ceil(num_frames / total_batch_size)
     epoch, batches_into_epoch = divmod(step, batches_per_epoch)
-    start_index = min(batches_into_epoch * batch_size * num_processes, num_frames)
+    start_index = min(batches_into_epoch * total_batch_size, num_frames)
     return {"epoch": epoch, "start_index": start_index}
