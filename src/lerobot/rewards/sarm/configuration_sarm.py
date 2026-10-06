@@ -230,8 +230,8 @@ class SARMConfig(RewardModelConfig):
         future_deltas = [self.frame_gap * i for i in range(1, half_steps + 1)]
         obs_deltas = past_deltas + [0] + future_deltas
 
-        # Rewind placeholders
-        rewind_deltas = [-self.frame_gap * (i + 1) for i in range(self.max_rewind_steps)]
+        # Rewind frames continue backwards from the earliest obs frame, matching apply_rewind_augmentation's targets.
+        rewind_deltas = [-self.frame_gap * (half_steps + i + 1) for i in range(self.max_rewind_steps)]
 
         return obs_deltas + rewind_deltas
 
