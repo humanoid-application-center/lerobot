@@ -56,6 +56,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -186,6 +187,30 @@ def update_policy(
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     return train_metrics, output_dict
+
+
+def resolve_phase_slots(meta) -> tuple[slice, int]:
+    """Locate the contiguous phase one-hot appended to observation.state, and its `unspecified` slot."""
+    names = meta.features[OBS_STATE]["names"][0]
+    indices = [i for i, n in enumerate(names) if n.startswith("phase_")]
+    if not indices:
+        raise ValueError(f"phase_dropout needs a phase one-hot in {OBS_STATE}; names are {names}")
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        raise ValueError(f"phase_ columns of {OBS_STATE} must be contiguous, got {indices}")
+    unspecified = [i for i in indices if names[i].endswith("_unspecified")]
+    if len(unspecified) != 1:
+        raise ValueError(f"expected exactly one phase_unspecified column, got {len(unspecified)}")
+    return slice(indices[0], indices[-1] + 1), unspecified[0]
+
+
+def apply_phase_dropout(batch: dict, phase_slots: slice, unspecified_slot: int, p: float) -> None:
+    """Train part of the batch as the whole task, by blanking the phase the sample carried."""
+    state = batch[OBS_STATE]
+    drop = torch.rand(state.shape[0], device=state.device) < p
+    if not drop.any():
+        return
+    state[drop, ..., phase_slots] = 0.0
+    state[drop, ..., unspecified_slot] = 1.0
 
 
 @parser.wrap()
@@ -587,12 +612,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {cfg.total_batch_size}"
         )
 
+    phase_slots, unspecified_slot = resolve_phase_slots(dataset.meta) if cfg.phase_dropout > 0 else (None, None)
+    if phase_slots is not None and is_main_process:
+        logging.info(
+            f"phase_dropout={cfg.phase_dropout}: {OBS_STATE}[{phase_slots.start}:{phase_slots.stop}] "
+            f"replaced by its unspecified slot on that fraction of samples"
+        )
+
     while step < cfg.steps:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        if phase_slots is not None:
+            apply_phase_dropout(batch, phase_slots, unspecified_slot, cfg.phase_dropout)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 

@@ -115,6 +115,10 @@ class TrainPipelineConfig(HubMixin):
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
     tolerance_s: float = 1e-4
+    # Fraction of samples trained as "whole task": the phase one-hot in observation.state is
+    # replaced by its `unspecified` slot, so one policy serves both the full-task and the
+    # per-phase button. 0.0 disables it.
+    phase_dropout: float = 0.0
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
