@@ -15,6 +15,7 @@
 # limitations under the License.
 import logging
 import math
+from pathlib import Path
 from pprint import pformat
 
 import torch
@@ -24,8 +25,10 @@ from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
+from lerobot.utils.io_utils import load_json
 
 from .dataset_metadata import LeRobotDatasetMetadata
+from .io_utils import cast_stats_to_numpy
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
@@ -126,6 +129,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
+    apply_stats_path(cfg, dataset)
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             if key in dataset.meta.depth_keys:
@@ -134,6 +138,19 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset
+
+
+def apply_stats_path(cfg: TrainPipelineConfig, dataset) -> None:
+    """Replace the dataset's stats with `cfg.dataset.stats_path`, when set (keys it lacks are kept)."""
+    if not cfg.dataset.stats_path:
+        return
+    path = Path(cfg.dataset.stats_path)
+    stats = cast_stats_to_numpy(load_json(path))
+    unknown = sorted(set(stats) - set(dataset.meta.stats or {}))
+    if unknown:
+        raise ValueError(f"{path} has stats for keys the dataset does not have: {unknown}")
+    dataset.meta.stats = {**(dataset.meta.stats or {}), **stats}
+    logging.info(f"Dataset stats of {sorted(stats)} from {path}")
 
 
 def make_train_eval_datasets(
@@ -205,6 +222,8 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
     )
 
+    for ds in (train_dataset, eval_dataset):
+        apply_stats_path(cfg, ds)
     if cfg.dataset.use_imagenet_stats:
         for ds in (train_dataset, eval_dataset):
             for key in ds.meta.camera_keys:

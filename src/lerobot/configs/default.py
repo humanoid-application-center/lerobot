@@ -46,6 +46,9 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # A stats file in the format of meta/stats.json, used instead of the dataset's own (which covers
+    # every episode, held-out ones included), e.g. statistics recomputed over the training episodes.
+    stats_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
