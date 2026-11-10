@@ -115,6 +115,11 @@ class TrainPipelineConfig(HubMixin):
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
     tolerance_s: float = 1e-4
+    # Batch transforms applied to training batches only, after the preprocessor, in order; each is
+    # {"type": <registered name>, ...its arguments}. See lerobot.common.train_hooks.
+    train_transforms: list[dict[str, Any]] = field(default_factory=list)
+    # Probes logging extra metrics during training, in the same format.
+    train_probes: list[dict[str, Any]] = field(default_factory=list)
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000

@@ -34,6 +34,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.train_hooks import TrainContext, TrainHooks
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
@@ -80,6 +81,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    after_backward=None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training micro-step (one forward/backward pass over `batch`).
@@ -100,6 +102,8 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        after_backward: Optional callable, called once the gradients of an optimizer step are
+            complete and clipped, before the update (the training probes' `after_backward`).
 
     Returns:
         A tuple containing:
@@ -158,6 +162,8 @@ def update_policy(
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), float("inf"), error_if_nonfinite=False
                 )
+            if after_backward is not None:
+                after_backward()
 
         # optimizer.step() / optimizer.zero_grad() are no-ops on intermediate accumulation
         # micro-batches; accelerate gates them internally on `accelerator.sync_gradients`.
@@ -542,6 +548,24 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     dl_iter = cycle(dataloader)
 
+    hooks = TrainHooks.from_config(
+        TrainContext(
+            cfg=cfg,
+            policy=policy,
+            preprocessor=preprocessor,
+            dataset=dataset,
+            eval_dataset=eval_dataset,
+            accelerator=accelerator,
+            output_dir=cfg.output_dir,
+        )
+    )
+    if is_main_process and (hooks.transforms or hooks.probes):
+        logging.info(
+            f"Train transforms: {[type(t).__name__ for t in hooks.transforms]}, "
+            f"probes: {[type(p).__name__ for p in hooks.probes]}"
+        )
+    probe_metrics: dict[str, float] = {}
+
     policy.train()
 
     train_metrics = {
@@ -594,6 +618,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
+        batch = hooks.transform(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -605,6 +630,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            after_backward=(lambda s=step: probe_metrics.update(hooks.after_backward(s + 1)))
+            if hooks.probes
+            else None,
         )
 
         if not accelerator.sync_gradients:
@@ -626,12 +654,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
+            probe_metrics.update(hooks.on_log(step, batch, output_dict))
             if is_main_process:
                 # Cluster-wide throughput, derived from the already-reduced (max) step time so it
                 # reflects the slowest rank — which is what actually gates the next iteration.
                 # update_s/dataloading_s average over micro-batches, so scale up to one full
                 # (post-accumulation) optimizer step before deriving throughput.
-                step_time = (train_tracker.update_s.avg + train_tracker.dataloading_s.avg) * accumulation_steps
+                step_time = (
+                    train_tracker.update_s.avg + train_tracker.dataloading_s.avg
+                ) * accumulation_steps
                 if step_time > 0:
                     train_tracker.samples_per_s = cfg.total_batch_size / step_time
                 logging.info(train_tracker)
@@ -644,7 +675,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
+                if probe_metrics:
+                    logging.info(
+                        f"step {step}: " + " ".join(f"{k}={v:.4g}" for k, v in probe_metrics.items())
+                    )
+                    if wandb_logger:
+                        wandb_logger.log_dict(probe_metrics, step)
             train_tracker.reset_averages()
+            probe_metrics.clear()
 
         if is_eval_step:
             policy.eval()
@@ -663,11 +701,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
             policy.train()
+            eval_metrics = hooks.on_eval(step)
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if eval_metrics:
+                    logging.info(f"step {step}: " + " ".join(f"{k}={v:.4g}" for k, v in eval_metrics.items()))
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    wandb_logger.log_dict({"eval_loss": eval_loss, **eval_metrics}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
@@ -694,6 +735,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     model_state_dict=model_state_dict,
                     optim_state_dict=optim_state_dict,
                 )
+                hooks.on_checkpoint(step, checkpoint_dir)
                 update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
