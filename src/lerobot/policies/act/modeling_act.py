@@ -432,6 +432,10 @@ class ACT(nn.Module):
                 False,
                 device=batch[OBS_STATE].device,
             )
+            if self.config.robot_state_feature:
+                cls_joint_is_pad[:, 1] = self._obs_is_pad(
+                    batch, OBS_STATE, batch_size, cls_joint_is_pad.device
+                )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
             )  # (bs, seq+1 or 2)
@@ -460,18 +464,26 @@ class ACT(nn.Module):
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        # Which tokens are missing, from the batch's `<key>_is_pad` (e.g. a training-time sensor
+        # dropout): those are left out of the attention. The latent token never is, so a sample always
+        # attends to something. Without any such key the mask is None, as before.
+        device = latent_sample.device
+        mask_inputs = any(f"{key}_is_pad" in batch for key in self._observation_keys())
+        encoder_in_is_pad = [torch.zeros(batch_size, 1, dtype=torch.bool, device=device)]
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_is_pad.append(self._obs_is_pad(batch, OBS_STATE, batch_size, device)[:, None])
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            encoder_in_is_pad.append(self._obs_is_pad(batch, OBS_ENV_STATE, batch_size, device)[:, None])
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
+            for key, img in zip(self.config.image_features, batch[OBS_IMAGES], strict=True):
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -484,13 +496,19 @@ class ACT(nn.Module):
                 # Convert to list to extend properly
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+                cam_is_pad = self._obs_is_pad(batch, key, batch_size, device)
+                encoder_in_is_pad.append(cam_is_pad[:, None].expand(batch_size, cam_features.shape[0]))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
 
+        key_padding_mask = torch.cat(encoder_in_is_pad, dim=1) if mask_inputs else None  # (B, S)
+
         # Forward pass through the transformer modules.
-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+        encoder_out = self.encoder(
+            encoder_in_tokens, pos_embed=encoder_in_pos_embed, key_padding_mask=key_padding_mask
+        )
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
@@ -502,6 +520,7 @@ class ACT(nn.Module):
             encoder_out,
             encoder_pos_embed=encoder_in_pos_embed,
             decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            encoder_key_padding_mask=key_padding_mask,
         )
 
         # Move back to (B, S, C).
@@ -510,6 +529,23 @@ class ACT(nn.Module):
         actions = self.action_head(decoder_out)
 
         return actions, (mu, log_sigma_x2)
+
+    def _observation_keys(self) -> list[str]:
+        keys = list(self.config.image_features)
+        if self.config.robot_state_feature:
+            keys.append(OBS_STATE)
+        if self.config.env_state_feature:
+            keys.append(OBS_ENV_STATE)
+        return keys
+
+    @staticmethod
+    def _obs_is_pad(batch: dict[str, Tensor], key: str, batch_size: int, device: torch.device) -> Tensor:
+        """(B,) True where `key` is missing for the sample. `<key>_is_pad` is (B,) or, with an
+        observation window, (B, T): the newest step decides. All False without that key."""
+        is_pad = batch.get(f"{key}_is_pad")
+        if is_pad is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        return is_pad.reshape(batch_size, -1)[:, -1].to(device=device, dtype=torch.bool)
 
 
 class ACTEncoder(nn.Module):
@@ -583,10 +619,15 @@ class ACTDecoder(nn.Module):
         encoder_out: Tensor,
         decoder_pos_embed: Tensor | None = None,
         encoder_pos_embed: Tensor | None = None,
+        encoder_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         for layer in self.layers:
             x = layer(
-                x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed
+                x,
+                encoder_out,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=encoder_pos_embed,
+                encoder_key_padding_mask=encoder_key_padding_mask,
             )
         if self.norm is not None:
             x = self.norm(x)
@@ -623,6 +664,7 @@ class ACTDecoderLayer(nn.Module):
         encoder_out: Tensor,
         decoder_pos_embed: Tensor | None = None,
         encoder_pos_embed: Tensor | None = None,
+        encoder_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
@@ -631,6 +673,7 @@ class ACTDecoderLayer(nn.Module):
                 cross-attending with.
             encoder_pos_embed: (ES, 1, C) positional embedding for keys (from the encoder).
             decoder_pos_embed: (DS, 1, C) positional embedding for the queries (from the decoder).
+            encoder_key_padding_mask: (B, ES) True for the encoder tokens not to attend to.
         Returns:
             (DS, B, C) tensor of decoder output features.
         """
@@ -650,6 +693,7 @@ class ACTDecoderLayer(nn.Module):
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
             value=encoder_out,
+            key_padding_mask=encoder_key_padding_mask,
         )[0]  # select just the output, not the attention weights
         x = skip + self.dropout2(x)
         if self.pre_norm:
