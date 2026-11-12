@@ -112,6 +112,11 @@ class ProcessorStepRegistry:
             KeyError: If the name is not found in the registry.
         """
         if name not in cls._registry:
+            # A plugin's steps (lerobot.common.feature_transforms) register when the plugin is imported.
+            from lerobot.common.train_hooks import load_train_hook_plugins
+
+            load_train_hook_plugins()
+        if name not in cls._registry:
             available = list(cls._registry.keys())
             raise KeyError(
                 f"Processor step '{name}' not found in registry. "

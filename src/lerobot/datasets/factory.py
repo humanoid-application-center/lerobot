@@ -69,6 +69,17 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def with_feature_transform_windows(
+    cfg: TrainPipelineConfig, delta_timestamps: dict[str, list] | None, fps: int
+) -> dict[str, list] | None:
+    """`delta_timestamps` plus the frames the config's feature transforms need (e.g. the previous state)."""
+    if not getattr(cfg, "feature_transforms", None):
+        return delta_timestamps
+    from lerobot.common.feature_transforms import build_feature_transforms, merge_delta_timestamps
+
+    return merge_delta_timestamps(delta_timestamps, build_feature_transforms(cfg.feature_transforms), fps)
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -89,7 +100,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
+        delta_timestamps = with_feature_transform_windows(
+            cfg, resolve_delta_timestamps(cfg.trainable_config, ds_meta), ds_meta.fps
+        )
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -192,7 +205,9 @@ def make_train_eval_datasets(
         f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
     )
 
-    delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta)
+    delta_timestamps = with_feature_transform_windows(
+        cfg, resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta), full_dataset.meta.fps
+    )
 
     train_image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
