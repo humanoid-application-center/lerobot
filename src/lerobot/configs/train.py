@@ -120,6 +120,10 @@ class TrainPipelineConfig(HubMixin):
     train_transforms: list[dict[str, Any]] = field(default_factory=list)
     # Probes logging extra metrics during training, in the same format.
     train_probes: list[dict[str, Any]] = field(default_factory=list)
+    # Preprocessor steps changing features before normalization (train, eval and inference: saved with
+    # the policy), in order, in the same format; the normalization statistics of the keys they change
+    # are computed over their output. See lerobot.common.feature_transforms.
+    feature_transforms: list[dict[str, Any]] = field(default_factory=list)
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
