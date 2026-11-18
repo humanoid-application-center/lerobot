@@ -34,6 +34,12 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.feature_transforms import (
+    build_feature_transforms,
+    compute_transformed_stats,
+    insert_feature_transforms,
+    transformed_meta,
+)
 from lerobot.common.train_hooks import TrainContext, TrainHooks
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
@@ -50,7 +56,12 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
-from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.factory import (
+    make_train_eval_datasets,
+    resolve_delta_timestamps,
+    with_feature_transform_windows,
+)
+from lerobot.datasets.feature_utils import get_delta_indices
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -300,6 +311,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    # The policy sees the dataset through the feature transforms, if any: their features, and the
+    # statistics of what they output (the dataset keeps its own metadata).
+    feature_steps = build_feature_transforms(cfg.feature_transforms)
+    policy_meta = dataset.meta
+    if feature_steps:
+        windows = with_feature_transform_windows(
+            cfg, resolve_delta_timestamps(cfg.trainable_config, dataset.meta), dataset.meta.fps
+        )
+        delta_indices = get_delta_indices(windows, dataset.meta.fps) if windows else None
+        policy_meta = transformed_meta(
+            dataset.meta, feature_steps, compute_transformed_stats(dataset, feature_steps, delta_indices)
+        )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -315,8 +339,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
         policy = make_reward_model(
             cfg=cfg.reward_model,
-            dataset_stats=dataset.meta.stats,
-            dataset_meta=dataset.meta,
+            dataset_stats=policy_meta.stats,
+            dataset_meta=policy_meta,
         )
         if not policy.is_trainable:
             raise ValueError(
@@ -328,7 +352,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             logging.info("Creating policy")
         policy = make_policy(
             cfg=cfg.policy,
-            ds_meta=dataset.meta,
+            ds_meta=policy_meta,
             rename_map=cfg.rename_map,
         )
 
@@ -352,16 +376,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     processor_kwargs = {}
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = policy_meta.stats
 
     if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
+        processor_kwargs["dataset_meta"] = policy_meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": policy_meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -369,7 +393,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         }
         postprocessor_overrides = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": policy_meta.stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -396,6 +420,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+        insert_feature_transforms(preprocessor, feature_steps)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -557,6 +582,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             eval_dataset=eval_dataset,
             accelerator=accelerator,
             output_dir=cfg.output_dir,
+            policy_meta=policy_meta,
         )
     )
     if is_main_process and (hooks.transforms or hooks.probes):

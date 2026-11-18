@@ -56,6 +56,9 @@ class TrainContext:
     eval_dataset: Any | None
     accelerator: Any
     output_dir: Path | None
+    # The dataset's metadata as the policy sees it: with feature transforms (lerobot.common.feature_transforms),
+    # their features and statistics; else the dataset's own.
+    policy_meta: Any | None = None
 
 
 class TrainTransform:
