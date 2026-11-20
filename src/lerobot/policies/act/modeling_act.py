@@ -461,9 +461,10 @@ class ACT(nn.Module):
                 batch[OBS_STATE].device
             )
 
-        # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        # Prepare transformer encoder inputs, as (sequence, batch, dim) blocks concatenated below: one
+        # block per camera, not one tensor per image token, so an export graph stays small.
+        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample).unsqueeze(0)]
+        encoder_in_pos_embed = [self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)]
         # Which tokens are missing, from the batch's `<key>_is_pad` (e.g. a training-time sensor
         # dropout): those are left out of the attention. The latent token never is, so a sample always
         # attends to something. Without any such key the mask is None, as before.
@@ -472,11 +473,11 @@ class ACT(nn.Module):
         encoder_in_is_pad = [torch.zeros(batch_size, 1, dtype=torch.bool, device=device)]
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(0))
             encoder_in_is_pad.append(self._obs_is_pad(batch, OBS_STATE, batch_size, device)[:, None])
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]).unsqueeze(0))
             encoder_in_is_pad.append(self._obs_is_pad(batch, OBS_ENV_STATE, batch_size, device)[:, None])
 
         if self.config.image_features:
@@ -492,16 +493,14 @@ class ACT(nn.Module):
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+                encoder_in_tokens.append(cam_features)
+                encoder_in_pos_embed.append(cam_pos_embed)
                 cam_is_pad = self._obs_is_pad(batch, key, batch_size, device)
                 encoder_in_is_pad.append(cam_is_pad[:, None].expand(batch_size, cam_features.shape[0]))
 
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        # Concatenate all tokens along the sequence dimension.
+        encoder_in_tokens = torch.cat(encoder_in_tokens, dim=0)
+        encoder_in_pos_embed = torch.cat(encoder_in_pos_embed, dim=0)
 
         key_padding_mask = torch.cat(encoder_in_is_pad, dim=1) if mask_inputs else None  # (B, S)
 
